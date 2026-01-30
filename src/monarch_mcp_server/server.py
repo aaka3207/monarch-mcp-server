@@ -47,7 +47,7 @@ load_dotenv()
 
 # Initialize FastMCP server
 _mcp_host = os.environ.get("MCP_HOST", "0.0.0.0") if IS_CONTAINER else "127.0.0.1"
-_mcp_port = int(os.environ.get("MCP_PORT", "8000"))
+_mcp_port = int(os.environ.get("MCP_PORT", "9000"))
 mcp = FastMCP("Monarch Money MCP Server", host=_mcp_host, port=_mcp_port)
 
 

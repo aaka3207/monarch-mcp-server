@@ -15,12 +15,12 @@ RUN pip install --no-cache-dir -r requirements.txt && \
 # Create data directory for credential storage
 RUN mkdir -p /data
 
-EXPOSE 8000
+EXPOSE 9000
 
 # Container defaults - SSE transport
 ENV MCP_TRANSPORT=sse
 ENV MCP_HOST=0.0.0.0
-ENV MCP_PORT=8000
+ENV MCP_PORT=9000
 ENV MONARCH_DATA_DIR=/data
 
 VOLUME /data
