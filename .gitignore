@@ -93,3 +93,17 @@ logs/
 tmp/
 temp/
 .tmp/
+
+# Deployment data (persistent credential storage)
+/data/
+monarchRecoveryTokens.txt
+
+# Planning files
+planning-with-files/
+
+# Serena memories
+.serena/
+
+# Claude docs
+docs/
+CLAUDE.md

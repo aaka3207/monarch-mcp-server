@@ -147,17 +147,23 @@ async def main():
             print(f"\n🔐 Saving session securely to system keyring...")
             secure_session.save_authenticated_session(mm)
             print(f"✅ Session saved securely to keyring!")
-                
+
+            # Save credentials for auto-re-authentication
+            print("🔑 Saving credentials for automatic re-authentication...")
+            secure_session.save_credentials(email, password)
+            print("✅ Credentials saved - will auto-renew when token expires!")
+
         except Exception as save_error:
             print(f"❌ Could not save session to keyring: {save_error}")
             print("You may need to run the login again.")
-        
+
         print("\n🎉 Setup complete! You can now use these tools in Claude Desktop:")
-        print("   • get_accounts - View all your accounts")  
+        print("   • get_accounts - View all your accounts")
         print("   • get_transactions - Recent transactions")
         print("   • get_budgets - Budget information")
         print("   • get_cashflow - Income/expense analysis")
         print("\n💡 Session will persist across Claude restarts!")
+        print("🔄 Token will auto-renew when it expires (no manual login needed)")
         
     except Exception as e:
         print(f"\n❌ Login failed: {e}")
