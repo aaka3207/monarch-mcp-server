@@ -1,12 +1,14 @@
 """
-Secure session management for Monarch Money MCP Server using keyring.
+Secure session management for Monarch Money MCP Server.
+Uses keyring (local dev) with file-based fallback (containers/deployment).
 """
 
 import asyncio
-import keyring
+import json
 import logging
 import os
 import traceback
+from pathlib import Path
 from typing import Optional, Tuple
 from monarchmoney import MonarchMoney
 
@@ -17,114 +19,218 @@ logger = logging.getLogger(__name__)
 from monarchmoney.monarchmoney import MonarchMoneyEndpoints
 MonarchMoneyEndpoints.BASE_URL = "https://api.monarch.com"
 
-# Add file handler to match server.py debug logging
-_debug_file_handler = logging.FileHandler("/tmp/monarch-mcp-debug.log")
-_debug_file_handler.setLevel(logging.DEBUG)
-_debug_file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
-logger.addHandler(_debug_file_handler)
-logger.setLevel(logging.DEBUG)
-
-# Keyring service identifiers
+# Keyring service identifiers (used when keyring is available)
 KEYRING_SERVICE = "com.mcp.monarch-mcp-server"
 KEYRING_USERNAME = "monarch-token"
 KEYRING_EMAIL = "monarch-email"
 KEYRING_PASSWORD = "monarch-password"
 KEYRING_MFA_SECRET = "monarch-mfa-secret"
 
+# File-based storage (used in containers / when keyring unavailable)
+DATA_DIR = Path(os.environ.get("MONARCH_DATA_DIR", "/data"))
+CREDENTIALS_FILE = "monarch_credentials.json"
+
+
+def _keyring_available() -> bool:
+    """Check if system keyring is available (not in container)."""
+    try:
+        import keyring
+        # Try a harmless read to verify keyring backend works
+        keyring.get_password(KEYRING_SERVICE, "__test__")
+        return True
+    except Exception:
+        return False
+
+
+# Determine storage backend at import time
+USE_KEYRING = _keyring_available()
+if USE_KEYRING:
+    import keyring
+    logger.info("🔑 Using system keyring for credential storage")
+else:
+    logger.info("📁 Using file-based credential storage (keyring unavailable)")
+
 
 class SecureMonarchSession:
-    """Manages Monarch Money sessions securely using the system keyring."""
+    """Manages Monarch Money sessions using keyring or file-based storage."""
+
+    # ========================================================================
+    # File-based storage helpers
+    # ========================================================================
+
+    def _get_credentials_path(self) -> Path:
+        """Get path to credentials file, creating directory if needed."""
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        return DATA_DIR / CREDENTIALS_FILE
+
+    def _read_file_store(self) -> dict:
+        """Read credentials from file storage."""
+        path = self._get_credentials_path()
+        if path.exists():
+            try:
+                return json.loads(path.read_text())
+            except (json.JSONDecodeError, OSError) as e:
+                logger.error(f"❌ Failed to read credentials file: {e}")
+        return {}
+
+    def _write_file_store(self, data: dict) -> None:
+        """Write credentials to file storage."""
+        path = self._get_credentials_path()
+        try:
+            path.write_text(json.dumps(data))
+            # Restrict permissions to owner only
+            path.chmod(0o600)
+            logger.debug("📁 Credentials written to file store")
+        except OSError as e:
+            logger.error(f"❌ Failed to write credentials file: {e}")
+            raise
+
+    # ========================================================================
+    # Credential operations (keyring or file-based)
+    # ========================================================================
 
     def save_credentials(self, email: str, password: str, mfa_secret: Optional[str] = None) -> None:
-        """Save email, password, and optionally MFA secret to keyring for auto-re-authentication."""
-        try:
-            keyring.set_password(KEYRING_SERVICE, KEYRING_EMAIL, email)
-            keyring.set_password(KEYRING_SERVICE, KEYRING_PASSWORD, password)
-            if mfa_secret:
-                keyring.set_password(KEYRING_SERVICE, KEYRING_MFA_SECRET, mfa_secret)
-                logger.info("✅ Credentials + MFA secret saved securely to keyring")
-            else:
-                logger.info("✅ Credentials saved securely to keyring")
-        except Exception as e:
-            logger.error(f"❌ Failed to save credentials to keyring: {e}")
-            raise
+        """Save email, password, and optionally MFA secret."""
+        if USE_KEYRING:
+            try:
+                keyring.set_password(KEYRING_SERVICE, KEYRING_EMAIL, email)
+                keyring.set_password(KEYRING_SERVICE, KEYRING_PASSWORD, password)
+                if mfa_secret:
+                    keyring.set_password(KEYRING_SERVICE, KEYRING_MFA_SECRET, mfa_secret)
+                logger.info("✅ Credentials saved to keyring")
+                return
+            except Exception as e:
+                logger.error(f"❌ Keyring save failed: {e}")
+                raise
+
+        # File-based fallback
+        store = self._read_file_store()
+        store["email"] = email
+        store["password"] = password
+        if mfa_secret:
+            store["mfa_secret"] = mfa_secret
+        self._write_file_store(store)
+        logger.info("✅ Credentials saved to file store")
 
     def save_mfa_secret(self, mfa_secret: str) -> None:
-        """Save MFA secret key to keyring."""
-        try:
+        """Save MFA secret key."""
+        if USE_KEYRING:
             keyring.set_password(KEYRING_SERVICE, KEYRING_MFA_SECRET, mfa_secret)
-            logger.info("✅ MFA secret saved securely to keyring")
-        except Exception as e:
-            logger.error(f"❌ Failed to save MFA secret to keyring: {e}")
-            raise
+            logger.info("✅ MFA secret saved to keyring")
+        else:
+            store = self._read_file_store()
+            store["mfa_secret"] = mfa_secret
+            self._write_file_store(store)
+            logger.info("✅ MFA secret saved to file store")
 
     def load_credentials(self) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-        """Load email, password, and MFA secret from keyring."""
-        try:
-            logger.debug("🔍 Attempting to load credentials from keyring...")
-            email = keyring.get_password(KEYRING_SERVICE, KEYRING_EMAIL)
-            password = keyring.get_password(KEYRING_SERVICE, KEYRING_PASSWORD)
-            mfa_secret = keyring.get_password(KEYRING_SERVICE, KEYRING_MFA_SECRET)
-            logger.debug(f"🔍 Credentials loaded: email={'yes' if email else 'no'}, password={'yes' if password else 'no'}, mfa={'yes' if mfa_secret else 'no'}")
-            if email and password:
-                logger.info("✅ Credentials loaded from keyring")
-            return email, password, mfa_secret
-        except Exception as e:
-            logger.error(f"❌ Failed to load credentials from keyring: {e}")
-            return None, None, None
+        """Load email, password, and MFA secret."""
+        if USE_KEYRING:
+            try:
+                logger.debug("🔍 Loading credentials from keyring...")
+                email = keyring.get_password(KEYRING_SERVICE, KEYRING_EMAIL)
+                password = keyring.get_password(KEYRING_SERVICE, KEYRING_PASSWORD)
+                mfa_secret = keyring.get_password(KEYRING_SERVICE, KEYRING_MFA_SECRET)
+                logger.debug(f"🔍 Credentials: email={'yes' if email else 'no'}, password={'yes' if password else 'no'}, mfa={'yes' if mfa_secret else 'no'}")
+                if email and password:
+                    logger.info("✅ Credentials loaded from keyring")
+                return email, password, mfa_secret
+            except Exception as e:
+                logger.error(f"❌ Failed to load from keyring: {e}")
+                return None, None, None
+
+        # File-based fallback
+        store = self._read_file_store()
+        email = store.get("email")
+        password = store.get("password")
+        mfa_secret = store.get("mfa_secret")
+        logger.debug(f"🔍 File store credentials: email={'yes' if email else 'no'}, password={'yes' if password else 'no'}, mfa={'yes' if mfa_secret else 'no'}")
+        if email and password:
+            logger.info("✅ Credentials loaded from file store")
+        return email, password, mfa_secret
 
     def delete_credentials(self) -> None:
-        """Delete stored credentials from keyring."""
-        for key in [KEYRING_EMAIL, KEYRING_PASSWORD, KEYRING_MFA_SECRET]:
-            try:
-                keyring.delete_password(KEYRING_SERVICE, key)
-            except keyring.errors.PasswordDeleteError:
-                pass
-            except Exception as e:
-                logger.warning(f"⚠️  Could not delete {key}: {e}")
-        logger.info("🗑️ Credentials deleted from keyring")
+        """Delete stored credentials."""
+        if USE_KEYRING:
+            for key in [KEYRING_EMAIL, KEYRING_PASSWORD, KEYRING_MFA_SECRET]:
+                try:
+                    keyring.delete_password(KEYRING_SERVICE, key)
+                except Exception:
+                    pass
+            logger.info("🗑️ Credentials deleted from keyring")
+        else:
+            store = self._read_file_store()
+            for key in ["email", "password", "mfa_secret"]:
+                store.pop(key, None)
+            self._write_file_store(store)
+            logger.info("🗑️ Credentials deleted from file store")
+
+    # ========================================================================
+    # Token operations
+    # ========================================================================
 
     def save_token(self, token: str) -> None:
-        """Save the authentication token to the system keyring."""
-        try:
-            keyring.set_password(KEYRING_SERVICE, KEYRING_USERNAME, token)
-            logger.info("✅ Token saved securely to keyring")
+        """Save the authentication token."""
+        if USE_KEYRING:
+            try:
+                keyring.set_password(KEYRING_SERVICE, KEYRING_USERNAME, token)
+                logger.info("✅ Token saved to keyring")
+                self._cleanup_old_session_files()
+                return
+            except Exception as e:
+                logger.error(f"❌ Keyring save failed: {e}")
+                raise
 
-            # Clean up any old insecure files
-            self._cleanup_old_session_files()
-
-        except Exception as e:
-            logger.error(f"❌ Failed to save token to keyring: {e}")
-            raise
+        # File-based fallback
+        store = self._read_file_store()
+        store["token"] = token
+        self._write_file_store(store)
+        logger.info("✅ Token saved to file store")
 
     def load_token(self) -> Optional[str]:
-        """Load the authentication token from the system keyring."""
-        try:
-            logger.debug(f"🔍 load_token() - Attempting keyring.get_password({KEYRING_SERVICE}, {KEYRING_USERNAME})")
-            token = keyring.get_password(KEYRING_SERVICE, KEYRING_USERNAME)
-            if token:
-                logger.info(f"✅ Token loaded from keyring (length: {len(token)})")
+        """Load the authentication token."""
+        if USE_KEYRING:
+            try:
+                logger.debug(f"🔍 load_token() - keyring.get_password({KEYRING_SERVICE}, {KEYRING_USERNAME})")
+                token = keyring.get_password(KEYRING_SERVICE, KEYRING_USERNAME)
+                if token:
+                    logger.info(f"✅ Token loaded from keyring (length: {len(token)})")
+                else:
+                    logger.info("🔍 No token found in keyring")
                 return token
-            else:
-                logger.info("🔍 No token found in keyring")
+            except Exception as e:
+                logger.error(f"❌ Failed to load token from keyring: {e}")
                 return None
-        except Exception as e:
-            logger.error(f"❌ Failed to load token from keyring: {type(e).__name__}: {e}")
-            return None
+
+        # File-based fallback
+        store = self._read_file_store()
+        token = store.get("token")
+        if token:
+            logger.info(f"✅ Token loaded from file store (length: {len(token)})")
+        else:
+            logger.info("🔍 No token found in file store")
+        return token
 
     def delete_token(self) -> None:
-        """Delete the authentication token from the system keyring."""
-        try:
-            keyring.delete_password(KEYRING_SERVICE, KEYRING_USERNAME)
-            logger.info("🗑️ Token deleted from keyring")
+        """Delete the authentication token."""
+        if USE_KEYRING:
+            try:
+                keyring.delete_password(KEYRING_SERVICE, KEYRING_USERNAME)
+                logger.info("🗑️ Token deleted from keyring")
+                self._cleanup_old_session_files()
+            except Exception:
+                logger.info("🔍 No token found in keyring to delete")
+            return
 
-            # Also clean up any old insecure files
-            self._cleanup_old_session_files()
+        # File-based fallback
+        store = self._read_file_store()
+        store.pop("token", None)
+        self._write_file_store(store)
+        logger.info("🗑️ Token deleted from file store")
 
-        except keyring.errors.PasswordDeleteError:
-            logger.info("🔍 No token found in keyring to delete")
-        except Exception as e:
-            logger.error(f"❌ Failed to delete token from keyring: {e}")
+    # ========================================================================
+    # Client operations
+    # ========================================================================
 
     def get_authenticated_client(self) -> Optional[MonarchMoney]:
         """Get an authenticated MonarchMoney client."""
@@ -161,16 +267,14 @@ class SecureMonarchSession:
         for attempt in range(max_retries):
             try:
                 if attempt > 0:
-                    wait_time = 2 ** attempt  # Exponential backoff: 2, 4, 8 seconds
+                    wait_time = 2 ** attempt
                     logger.info(f"🔄 Retry {attempt + 1}/{max_retries} after {wait_time}s...")
                     await asyncio.sleep(wait_time)
 
                 logger.info("🔄 Attempting re-authentication with stored credentials...")
                 client = MonarchMoney()
 
-                # Use MFA secret key if available for seamless re-auth
-                # IMPORTANT: save_session=False prevents monarchmoney from trying to create
-                # a .mm/ directory, which fails when running from Claude Desktop (runs from /)
+                # save_session=False prevents monarchmoney from creating .mm/ directory
                 if mfa_secret:
                     logger.info("🔐 Using stored MFA secret for authentication")
                     logger.debug(f"🔍 Calling client.login with email={email[:3]}***")
@@ -181,7 +285,6 @@ class SecureMonarchSession:
 
                 logger.debug(f"🔍 Login completed, token={'present' if client.token else 'missing'}")
 
-                # Save the new token
                 if client.token:
                     self.save_token(client.token)
                     logger.info("✅ Re-authentication successful, new token saved")
@@ -192,13 +295,11 @@ class SecureMonarchSession:
                 error_str = str(e)
                 logger.warning(f"⚠️  Auth attempt {attempt + 1} failed: {type(e).__name__}: {e}")
 
-                # Retry on transient errors (SSL, network, 5xx)
                 if any(x in error_str for x in ["525", "SSL", "timeout", "connection", "5"]):
                     logger.debug("🔍 Transient error detected, will retry...")
                     continue
                 else:
-                    # Non-transient error, don't retry
-                    logger.error(f"❌ Non-transient error, stopping retries")
+                    logger.error("❌ Non-transient error, stopping retries")
                     break
 
         logger.error(f"❌ Re-authentication failed after {max_retries} attempts: {type(last_error).__name__}: {last_error}")
@@ -210,15 +311,14 @@ class SecureMonarchSession:
         cleanup_paths = [
             ".mm/mm_session.pickle",
             "monarch_session.json",
-            ".mm",  # Remove the entire directory if empty
+            ".mm",
         ]
-
         for path in cleanup_paths:
             try:
                 if os.path.exists(path):
                     if os.path.isfile(path):
                         os.remove(path)
-                        logger.info(f"🗑️ Cleaned up old insecure session file: {path}")
+                        logger.info(f"🗑️ Cleaned up old session file: {path}")
                     elif os.path.isdir(path) and not os.listdir(path):
                         os.rmdir(path)
                         logger.info(f"🗑️ Cleaned up empty session directory: {path}")

@@ -10,9 +10,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 
 from dotenv import load_dotenv
-from mcp.server.auth.provider import AccessTokenT
 from mcp.server.fastmcp import FastMCP
-import mcp.types as types
 from monarchmoney import MonarchMoney, RequireMFAException
 from pydantic import BaseModel, Field
 from monarch_mcp_server.secure_session import secure_session
@@ -25,22 +23,32 @@ MonarchMoneyEndpoints.BASE_URL = "https://api.monarch.com"
 logger_temp = logging.getLogger(__name__)
 logger_temp.info("🔧 Patched MonarchMoneyEndpoints.BASE_URL to https://api.monarch.com")
 
-# Configure logging - both console and file for debugging
-logging.basicConfig(level=logging.INFO)
+# Configure logging - stdout for containers, file for local dev
+IS_CONTAINER = os.environ.get("MCP_TRANSPORT", "stdio") != "stdio"
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+)
 logger = logging.getLogger(__name__)
-
-# Add file handler for debugging Claude Desktop issues
-_debug_file_handler = logging.FileHandler("/tmp/monarch-mcp-debug.log")
-_debug_file_handler.setLevel(logging.DEBUG)
-_debug_file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-logger.addHandler(_debug_file_handler)
 logger.setLevel(logging.DEBUG)
+
+if not IS_CONTAINER:
+    # Local dev: also log to file for debugging Claude Desktop issues
+    try:
+        _debug_file_handler = logging.FileHandler("/tmp/monarch-mcp-debug.log")
+        _debug_file_handler.setLevel(logging.DEBUG)
+        _debug_file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        logger.addHandler(_debug_file_handler)
+    except OSError:
+        pass  # Can't write to /tmp in some environments
 
 # Load environment variables
 load_dotenv()
 
 # Initialize FastMCP server
-mcp = FastMCP("Monarch Money MCP Server")
+_mcp_host = os.environ.get("MCP_HOST", "0.0.0.0") if IS_CONTAINER else "127.0.0.1"
+_mcp_port = int(os.environ.get("MCP_PORT", "8000"))
+mcp = FastMCP("Monarch Money MCP Server", host=_mcp_host, port=_mcp_port)
 
 
 # ============================================================================
@@ -1324,11 +1332,288 @@ def delete_transaction(transaction_id: str) -> str:
         return f"Error deleting transaction: {str(e)}"
 
 
+# ============================================================================
+# WEB ROUTES (for deployed/container mode)
+# ============================================================================
+
+import secrets
+import time
+
+# Login tokens: {token: expiry_timestamp}
+_login_tokens: dict[str, float] = {}
+LOGIN_TOKEN_TTL = 600  # 10 minutes
+
+
+def _generate_login_token() -> str:
+    """Generate a single-use login token with expiry."""
+    # Clean expired tokens
+    now = time.time()
+    expired = [t for t, exp in _login_tokens.items() if exp < now]
+    for t in expired:
+        del _login_tokens[t]
+
+    token = secrets.token_urlsafe(32)
+    _login_tokens[token] = now + LOGIN_TOKEN_TTL
+    return token
+
+
+def _validate_login_token(token: str) -> bool:
+    """Validate and consume a login token (single-use)."""
+    if not token or token not in _login_tokens:
+        return False
+    if time.time() > _login_tokens[token]:
+        del _login_tokens[token]
+        return False
+    del _login_tokens[token]  # Single-use: consume on validation
+    return True
+
+
+@mcp.tool()
+def get_login_url() -> str:
+    """
+    Generate a secure one-time login URL for the web authentication page.
+    The URL contains a cryptographic token that expires after 10 minutes.
+    Use this when you need to authenticate with Monarch Money via the web login.
+
+    Returns: A one-time login URL
+    """
+    token = _generate_login_token()
+    base_url = os.environ.get("MCP_PUBLIC_URL", f"http://localhost:{_mcp_port}")
+    login_url = f"{base_url}/login?token={token}"
+    logger.info(f"🔗 Generated login URL (token expires in {LOGIN_TOKEN_TTL}s)")
+    return json.dumps({
+        "login_url": login_url,
+        "expires_in_seconds": LOGIN_TOKEN_TTL,
+        "note": "This URL is single-use and expires in 10 minutes."
+    }, indent=2)
+
+
+if IS_CONTAINER:
+    from starlette.requests import Request
+    from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse
+
+    LOGIN_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Monarch Money - MCP Server Login</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+               background: #0f172a; color: #e2e8f0; min-height: 100vh;
+               display: flex; align-items: center; justify-content: center; }
+        .container { background: #1e293b; border-radius: 12px; padding: 2rem;
+                     max-width: 420px; width: 100%; box-shadow: 0 4px 24px rgba(0,0,0,0.3); }
+        h1 { font-size: 1.5rem; margin-bottom: 0.5rem; text-align: center; }
+        p.subtitle { color: #94a3b8; text-align: center; margin-bottom: 1.5rem; font-size: 0.9rem; }
+        label { display: block; font-size: 0.85rem; color: #94a3b8; margin-bottom: 0.3rem; }
+        input { width: 100%; padding: 0.7rem; border-radius: 8px; border: 1px solid #334155;
+                background: #0f172a; color: #e2e8f0; font-size: 1rem; margin-bottom: 1rem; }
+        input:focus { outline: none; border-color: #6366f1; }
+        button { width: 100%; padding: 0.8rem; border-radius: 8px; border: none;
+                 background: #6366f1; color: white; font-size: 1rem; cursor: pointer;
+                 font-weight: 600; }
+        button:hover { background: #4f46e5; }
+        button:active { transform: scale(0.98); }
+        button:disabled { background: #475569; cursor: not-allowed; transform: none; }
+        button .spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid rgba(255,255,255,0.3);
+                          border-top-color: white; border-radius: 50%; animation: spin 0.6s linear infinite;
+                          vertical-align: middle; margin-right: 0.5rem; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .status { margin-top: 1rem; padding: 0.8rem; border-radius: 8px; font-size: 0.9rem; display: none; }
+        .status.success { display: block; background: #064e3b; color: #6ee7b7; }
+        .status.error { display: block; background: #450a0a; color: #fca5a5; }
+        .mfa-section { display: none; }
+        .mfa-section.show { display: block; }
+        @media (max-width: 480px) {
+            .container { margin: 1rem; padding: 1.5rem; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Monarch Money</h1>
+        <p class="subtitle">MCP Server Authentication</p>
+        <form id="loginForm">
+            <label for="email">Email</label>
+            <input type="email" id="email" name="email" required placeholder="your@email.com">
+
+            <label for="password">Password</label>
+            <input type="password" id="password" name="password" required placeholder="Password">
+
+            <div id="mfaSection" class="mfa-section">
+                <label for="mfa_secret">MFA Secret Key (TOTP base32, for auto-renewal)</label>
+                <input type="text" id="mfa_secret" name="mfa_secret" placeholder="Optional - enables auto token renewal">
+            </div>
+
+            <label style="display:flex;align-items:center;gap:0.5rem;margin-bottom:1rem;cursor:pointer;">
+                <input type="checkbox" id="showMfa" style="width:auto;margin:0;">
+                <span>I have MFA enabled</span>
+            </label>
+
+            <button type="submit" id="submitBtn">Sign In</button>
+        </form>
+        <div id="status" class="status"></div>
+    </div>
+    <script>
+        document.getElementById('showMfa').addEventListener('change', function() {
+            document.getElementById('mfaSection').classList.toggle('show', this.checked);
+        });
+        document.getElementById('loginForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            const btn = document.getElementById('submitBtn');
+            const status = document.getElementById('status');
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner"></span>Authenticating...';
+            status.className = 'status';
+            status.style.display = 'none';
+            try {
+                const formToken = document.getElementById('loginForm').dataset.token;
+                const resp = await fetch('/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        token: formToken,
+                        email: document.getElementById('email').value,
+                        password: document.getElementById('password').value,
+                        mfa_secret: document.getElementById('mfa_secret').value || null
+                    })
+                });
+                const data = await resp.json();
+                if (resp.ok) {
+                    status.className = 'status success';
+                    status.textContent = data.message;
+                } else {
+                    status.className = 'status error';
+                    status.textContent = data.error || 'Authentication failed';
+                }
+            } catch (err) {
+                status.className = 'status error';
+                status.textContent = 'Network error: ' + err.message;
+            }
+            btn.disabled = false;
+            btn.textContent = 'Sign In';
+        });
+    </script>
+</body>
+</html>"""
+
+    @mcp.custom_route("/login", methods=["GET"])
+    async def login_page(request: Request) -> HTMLResponse:
+        token = request.query_params.get("token", "")
+        if not _validate_login_token(token):
+            return HTMLResponse(
+                "<h1>Access Denied</h1><p>Invalid or expired login link. "
+                "Use the <code>get_login_url</code> MCP tool to generate a new one.</p>",
+                status_code=403,
+            )
+        # Generate a new single-use token for the POST submission
+        post_token = _generate_login_token()
+        html = LOGIN_HTML.replace('id="loginForm"', f'id="loginForm" data-token="{post_token}"')
+        return HTMLResponse(html)
+
+    @mcp.custom_route("/login", methods=["POST"])
+    async def handle_login(request: Request) -> JSONResponse:
+        try:
+            body = await request.json()
+
+            # Validate the post token
+            post_token = body.get("token", "")
+            if not _validate_login_token(post_token):
+                return JSONResponse({"error": "Session expired. Generate a new login URL."}, status_code=403)
+
+            email = body.get("email")
+            password = body.get("password")
+            mfa_secret = body.get("mfa_secret")
+
+            if not email or not password:
+                return JSONResponse({"error": "Email and password required"}, status_code=400)
+
+            # Attempt login
+            client = MonarchMoney()
+            if mfa_secret:
+                await client.login(email, password, mfa_secret_key=mfa_secret, save_session=False)
+            else:
+                await client.login(email, password, save_session=False)
+
+            if not client.token:
+                return JSONResponse({"error": "Login succeeded but no token received"}, status_code=500)
+
+            # Save credentials and token
+            secure_session.save_credentials(email, password, mfa_secret)
+            secure_session.save_token(client.token)
+
+            logger.info(f"✅ Web login successful for {email[:3]}***")
+            return JSONResponse({"message": "Authenticated successfully! MCP server is ready."})
+
+        except RequireMFAException:
+            return JSONResponse({"error": "MFA required. Enable the MFA checkbox and provide your TOTP secret key."}, status_code=401)
+        except Exception as e:
+            logger.error(f"❌ Web login failed: {e}")
+            return JSONResponse({"error": f"Authentication failed: {str(e)}"}, status_code=401)
+
+    @mcp.custom_route("/health", methods=["GET"])
+    async def health_check(request: Request) -> JSONResponse:
+        """Deep health check: server up + auth valid + API reachable."""
+        health = {"server": "ok", "authenticated": False, "api_reachable": False}
+        status_code = 200
+
+        # Check token exists
+        token = secure_session.load_token()
+        if not token:
+            health["error"] = "No token stored. Login required at /login"
+            return JSONResponse(health, status_code=503)
+
+        health["authenticated"] = True
+
+        # Validate token against Monarch API
+        try:
+            async def _check():
+                client = MonarchMoney(token=token)
+                return await client.get_subscription_details()
+
+            run_async(_check())
+            health["api_reachable"] = True
+        except Exception as e:
+            error_str = str(e)
+            health["api_reachable"] = False
+
+            # Attempt auto-recovery
+            try:
+                async def _reauth():
+                    return await secure_session.reauthenticate()
+
+                client = run_async(_reauth())
+                if client:
+                    health["api_reachable"] = True
+                    health["recovered"] = True
+                    logger.info("✅ Health check triggered successful re-authentication")
+                else:
+                    health["error"] = "Token expired, auto-recovery failed"
+                    status_code = 503
+            except Exception as reauth_err:
+                health["error"] = f"Token expired, recovery failed: {str(reauth_err)}"
+                status_code = 503
+
+        return JSONResponse(health, status_code=status_code)
+
+    @mcp.custom_route("/status", methods=["GET"])
+    async def auth_status(request: Request) -> JSONResponse:
+        token = secure_session.load_token()
+        if token:
+            return JSONResponse({"authenticated": True, "token_length": len(token)})
+        return JSONResponse({"authenticated": False})
+
+
 def main():
     """Main entry point for the server."""
-    logger.info("Starting Monarch Money MCP Server...")
+    transport = os.environ.get("MCP_TRANSPORT", "stdio")
+
+    logger.info(f"Starting Monarch Money MCP Server (transport={transport}, host={_mcp_host}, port={_mcp_port})")
+
     try:
-        mcp.run()
+        mcp.run(transport=transport)
     except Exception as e:
         logger.error(f"Failed to run server: {str(e)}")
         raise
