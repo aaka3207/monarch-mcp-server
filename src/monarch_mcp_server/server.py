@@ -1532,10 +1532,15 @@ if IS_CONTAINER:
 
             # Attempt login
             client = MonarchMoney()
-            if mfa_secret:
-                await client.login(email, password, mfa_secret_key=mfa_secret, save_session=False)
-            else:
+            try:
                 await client.login(email, password, save_session=False)
+            except RequireMFAException:
+                if not mfa_secret:
+                    return JSONResponse({"error": "MFA required. Provide your TOTP secret key."}, status_code=401)
+                import pyotp
+                totp = pyotp.TOTP(mfa_secret)
+                mfa_code = totp.now()
+                await client.multi_factor_authenticate(email, password, mfa_code)
 
             if not client.token:
                 return JSONResponse({"error": "Login succeeded but no token received"}, status_code=500)
@@ -1546,9 +1551,6 @@ if IS_CONTAINER:
 
             logger.info(f"✅ Web login successful for {email[:3]}***")
             return JSONResponse({"message": "Authenticated successfully! MCP server is ready."})
-
-        except RequireMFAException:
-            return JSONResponse({"error": "MFA required. Enable the MFA checkbox and provide your TOTP secret key."}, status_code=401)
         except Exception as e:
             logger.error(f"❌ Web login failed: {e}")
             return JSONResponse({"error": f"Authentication failed: {str(e)}"}, status_code=401)

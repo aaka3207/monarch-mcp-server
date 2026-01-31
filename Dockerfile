@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends git && \
 # Install dependencies
 COPY requirements.txt pyproject.toml setup.cfg* ./
 COPY src/ src/
+COPY login_setup.py .
 RUN pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir -e .
 

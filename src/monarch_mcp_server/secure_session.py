@@ -10,7 +10,7 @@ import os
 import traceback
 from pathlib import Path
 from typing import Optional, Tuple
-from monarchmoney import MonarchMoney
+from monarchmoney import MonarchMoney, RequireMFAException
 
 logger = logging.getLogger(__name__)
 
@@ -274,14 +274,20 @@ class SecureMonarchSession:
                 logger.info("🔄 Attempting re-authentication with stored credentials...")
                 client = MonarchMoney()
 
-                # save_session=False prevents monarchmoney from creating .mm/ directory
-                if mfa_secret:
-                    logger.info("🔐 Using stored MFA secret for authentication")
+                # Try login first; if MFA is required, handle it with stored secret
+                try:
                     logger.debug(f"🔍 Calling client.login with email={email[:3]}***")
-                    await client.login(email, password, mfa_secret_key=mfa_secret, save_session=False)
-                else:
-                    logger.debug(f"🔍 Calling client.login without MFA, email={email[:3]}***")
                     await client.login(email, password, save_session=False)
+                except RequireMFAException:
+                    if not mfa_secret:
+                        logger.error("❌ MFA required but no MFA secret stored")
+                        return None
+                    logger.info("🔐 MFA required, generating TOTP from stored secret...")
+                    import pyotp
+                    totp = pyotp.TOTP(mfa_secret)
+                    mfa_code = totp.now()
+                    await client.multi_factor_authenticate(email, password, mfa_code)
+                    logger.info("✅ MFA authentication successful")
 
                 logger.debug(f"🔍 Login completed, token={'present' if client.token else 'missing'}")
 
@@ -295,7 +301,7 @@ class SecureMonarchSession:
                 error_str = str(e)
                 logger.warning(f"⚠️  Auth attempt {attempt + 1} failed: {type(e).__name__}: {e}")
 
-                if any(x in error_str for x in ["525", "SSL", "timeout", "connection", "5"]):
+                if any(x in error_str for x in ["525", "SSL", "timeout", "connection"]):
                     logger.debug("🔍 Transient error detected, will retry...")
                     continue
                 else:

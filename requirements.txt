@@ -2,6 +2,7 @@ mcp[cli]>=1.0.0
 monarchmoney @ git+https://github.com/hammem/monarchmoney.git
 gql>=4.0
 keyring>=24.0.0
+pyotp>=2.9.0
 python-dotenv>=1.0.0
 pydantic>=2.0.0
 starlette>=0.27.0
